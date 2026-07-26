@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION=1.2.1
+VERSION=1.2.2
 REPO=MetaCubeX/mihomo
 BIN=/usr/local/bin/mihomo
 SERVICE=/etc/systemd/system/mihomo.service
@@ -15,6 +15,14 @@ GITHUB_MIRROR=
 DOWNLOAD_PROXY=
 CONFIG_FILE=
 TMP=
+SERVICE_STATE=
+HEALTH_MIXED_STATUS=
+HEALTH_MIXED_OWNER=
+HEALTH_CONTROLLER_STATUS=
+HEALTH_CONTROLLER_OWNER=
+HEALTH_LOG_ERROR=
+PORT_STATUS=
+PORT_OWNER=
 
 if [[ -t 1 ]]; then R='\033[0m'; RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033[36m'; else R=; RED=; GREEN=; YELLOW=; BLUE=; CYAN=; fi
 info(){ printf '%b[信息]%b %s\n' "$BLUE" "$R" "$*"; }
@@ -129,55 +137,95 @@ show_download(){
   else printf '直连 GitHub'
   fi
 }
-install_state(){
-  local has_binary=0 has_service=0
+current_invocation_logs(){
+  local invocation start
+  invocation=$(systemctl show mihomo -p InvocationID --value 2>/dev/null || true)
+  if [[ -n $invocation ]]; then
+    journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --no-pager -o cat 2>/dev/null || true
+    return
+  fi
+  start=$(systemctl show mihomo -p ActiveEnterTimestamp --value 2>/dev/null || true)
+  if [[ -n $start ]]; then journalctl -u mihomo --since "$start" --no-pager -o cat 2>/dev/null || true
+  else journalctl -u mihomo -n 100 --no-pager -o cat 2>/dev/null || true
+  fi
+}
+check_port(){
+  local port=$1 pid=$2 lines owner=
+  PORT_STATUS=unknown
+  PORT_OWNER=
+  command -v ss >/dev/null 2>&1 || return 0
+  lines=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+  if [[ -z $lines ]]; then PORT_STATUS=missing; return 0; fi
+  if [[ $pid =~ ^[1-9][0-9]*$ ]] && grep -Fq "pid=$pid," <<<"$lines"; then PORT_STATUS=owned; return 0; fi
+  if grep -q 'pid=' <<<"$lines"; then
+    PORT_STATUS=other
+    owner=$(printf '%s\n' "$lines" | sed -nE 's/.*users:\(\("([^"]+)",pid=([0-9]+).*/\1 (PID \2)/p' | head -n1)
+    PORT_OWNER=${owner:-其他进程}
+  else
+    PORT_STATUS=listening
+  fi
+}
+evaluate_service(){
+  local has_binary=0 has_service=0 pid=0 logs=
+  SERVICE_STATE=not-installed
+  HEALTH_MIXED_STATUS=unknown; HEALTH_MIXED_OWNER=
+  HEALTH_CONTROLLER_STATUS=unknown; HEALTH_CONTROLLER_OWNER=
+  HEALTH_LOG_ERROR=
   [[ -x $BIN ]] && has_binary=1
   [[ -f $SERVICE ]] && has_service=1
-  if ((has_binary==0 && has_service==0)); then printf 'not-installed'
-  elif ((has_binary==1 && has_service==1)); then
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mihomo 2>/dev/null; then printf 'running'; else printf 'stopped'; fi
-  elif ((has_binary==1)); then printf 'binary-only'
-  else printf 'broken'
+  if ((has_binary==0 && has_service==0)); then return
+  elif ((has_binary==1 && has_service==0)); then SERVICE_STATE=binary-only; return
+  elif ((has_binary==0 && has_service==1)); then SERVICE_STATE=broken; return
   fi
+  if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-active --quiet mihomo 2>/dev/null; then SERVICE_STATE=stopped; return; fi
+  SERVICE_STATE=running
+  pid=$(systemctl show mihomo -p MainPID --value 2>/dev/null || printf '0')
+  check_port "$MIXED_PORT" "$pid"; HEALTH_MIXED_STATUS=$PORT_STATUS; HEALTH_MIXED_OWNER=$PORT_OWNER
+  check_port "$CONTROLLER_PORT" "$pid"; HEALTH_CONTROLLER_STATUS=$PORT_STATUS; HEALTH_CONTROLLER_OWNER=$PORT_OWNER
+  logs=$(current_invocation_logs)
+  HEALTH_LOG_ERROR=$(printf '%s\n' "$logs" | grep -Ei -m1 'Start .* server error|RESTful API.*(error|failed)|address already in use|bind: permission denied|failed to listen|listen (tcp|udp).*(failed|error)' || true)
+  if [[ -n $HEALTH_LOG_ERROR || $HEALTH_MIXED_STATUS == missing || $HEALTH_MIXED_STATUS == other || $HEALTH_CONTROLLER_STATUS == missing || $HEALTH_CONTROLLER_STATUS == other ]]; then SERVICE_STATE=degraded; fi
 }
 state_text(){
   case $1 in
     not-installed) printf '未安装';;
     running) printf '运行中';;
+    degraded) printf '运行异常';;
     stopped) printf '已安装，未运行';;
     binary-only) printf '已安装，systemd 服务未注册';;
     broken) printf 'systemd 服务已注册，但 Mihomo 二进制缺失';;
   esac
 }
-mihomo_version(){
-  local version=
-  [[ -x $BIN ]] && version=$("$BIN" -v 2>/dev/null | sed -n '1p' || true)
-  printf '%s' "${version:-未知}"
+port_text(){
+  case $1 in
+    owned) printf '正常';;
+    listening) printf '已监听，但无法确认所属进程';;
+    missing) printf '异常：未监听';;
+    other) printf '异常：被 %s 占用' "${2:-其他进程}";;
+    unknown) printf '未检查（系统缺少 ss 或权限不足）';;
+  esac
 }
-autostart_text(){
-  if [[ ! -f $SERVICE ]]; then printf '未注册'
-  elif command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet mihomo 2>/dev/null; then printf '已启用'
-  else printf '未启用'
-  fi
-}
+mihomo_version(){ local version=; [[ -x $BIN ]] && version=$("$BIN" -v 2>/dev/null | sed -n '1p' || true); printf '%s' "${version:-未知}"; }
+autostart_text(){ if [[ ! -f $SERVICE ]]; then printf '未注册'; elif command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet mihomo 2>/dev/null; then printf '已启用'; else printf '未启用'; fi; }
 show_summary(){
   load_state
-  local state status version autostart secret_status
-  state=$(install_state)
-  status=$(state_text "$state")
-  printf '\n状态：%s\n' "$status"
-  [[ $state == not-installed ]] && return
+  evaluate_service
+  local status version autostart secret_status
+  status=$(state_text "$SERVICE_STATE")
+  if [[ $SERVICE_STATE == degraded ]]; then printf '\n%b状态：%s%b\n' "$RED" "$status" "$R"; else printf '\n状态：%s\n' "$status"; fi
+  [[ $SERVICE_STATE == not-installed ]] && return
   version=$(mihomo_version)
   autostart=$(autostart_text)
   [[ -n $SECRET ]] && secret_status=已设置 || secret_status=未设置
   printf 'Mihomo 版本：%s\n' "$version"
   printf '配置目录：%s\n' "$CONFIG_DIR"
   printf '配置文件：%s\n' "$CONFIG_FILE"
-  printf 'Mixed 端口：%s\n' "$MIXED_PORT"
-  printf '控制 API：%s:%s\n' "$CONTROLLER_HOST" "$CONTROLLER_PORT"
+  printf 'Mixed 端口：%s（' "$MIXED_PORT"; port_text "$HEALTH_MIXED_STATUS" "$HEALTH_MIXED_OWNER"; printf '）\n'
+  printf '控制 API：%s:%s（' "$CONTROLLER_HOST" "$CONTROLLER_PORT"; port_text "$HEALTH_CONTROLLER_STATUS" "$HEALTH_CONTROLLER_OWNER"; printf '）\n'
   printf 'API Secret：%s\n' "$secret_status"
   printf '开机自启：%s\n' "$autostart"
   printf 'GitHub 下载方式：'; show_download; printf '\n'
+  if [[ -n $HEALTH_LOG_ERROR ]]; then printf '%b启动错误：%s%b\n' "$RED" "$HEALTH_LOG_ERROR" "$R"; fi
 }
 prompt_download(){
   local choice= value=
@@ -198,6 +246,7 @@ prompt_settings(){
   read_tty value "Mixed 端口 [$MIXED_PORT]："; [[ -n $value ]] && MIXED_PORT=$value; port_ok "$MIXED_PORT" || die 'Mixed 端口无效。'
   read_tty value "控制 API 地址 [$CONTROLLER_HOST]："; [[ -n $value ]] && CONTROLLER_HOST=$value
   read_tty value "控制 API 端口 [$CONTROLLER_PORT]："; [[ -n $value ]] && CONTROLLER_PORT=$value; port_ok "$CONTROLLER_PORT" || die '控制端口无效。'
+  [[ $MIXED_PORT != "$CONTROLLER_PORT" ]] || die 'Mixed 端口与控制 API 端口不能相同。'
   read_tty value 'API Secret（留空则保留或生成）：' 1; [[ -n $value ]] && SECRET=$value; [[ -n $SECRET ]] || SECRET=$(secret_gen)
   CONFIG_FILE=${CONFIG_DIR%/}/config.yaml
   mkdir -p "$CONFIG_DIR"
@@ -252,7 +301,13 @@ UMask=0027
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload; }
-
+verify_after_start(){
+  sleep 1
+  show_summary
+  if [[ $SERVICE_STATE == running ]]; then return 0; fi
+  if [[ $SERVICE_STATE == degraded ]]; then warn 'Mihomo 主进程仍在运行，但监听检查发现异常。请修改冲突端口后重启。'; return 1; fi
+  return 1
+}
 install_action(){
   root; systemd; load_state; prompt_download; save_state; download; prompt_settings; test_cfg "$TMP/mihomo" || die '配置检查失败。'
   local rollback=
@@ -260,34 +315,43 @@ install_action(){
   install -m 0755 "$TMP/mihomo" "$BIN"
   write_service
   systemctl enable mihomo >/dev/null
-  if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then
-    [[ -n $rollback ]] && rm -f "$rollback"
+  if systemctl restart mihomo; then
     save_state
-    ok 'Mihomo 已安装并设置为开机自启。'
-    show_summary
-  else
-    [[ -n $rollback ]] && mv -f "$rollback" "$BIN"
-    systemctl restart mihomo >/dev/null 2>&1 || true
-    die '启动失败，已尝试回滚。'
+    if verify_after_start; then [[ -n $rollback ]] && rm -f "$rollback"; ok 'Mihomo 已安装并设置为开机自启。'; return; fi
+    warn 'Mihomo 已安装，但当前运行异常。'
+    return 1
   fi
+  [[ -n $rollback ]] && mv -f "$rollback" "$BIN"
+  systemctl restart mihomo >/dev/null 2>&1 || true
+  die '启动失败，已尝试回滚。'
 }
 upgrade_action(){
   root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; download; test_cfg "$TMP/mihomo" || die '新版本不兼容当前配置。'
   cp -a "$BIN" "$BIN.rollback"
   install -m 0755 "$TMP/mihomo" "$BIN"
-  if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then
-    rm -f "$BIN.rollback"
-    ok '升级完成。'
-    show_summary
-  else
-    mv -f "$BIN.rollback" "$BIN"
-    systemctl restart mihomo || true
-    die '升级失败，已回滚。'
+  if systemctl restart mihomo; then
+    if verify_after_start; then rm -f "$BIN.rollback"; ok '升级完成。'; return; fi
+    warn 'Mihomo 二进制已升级，但当前运行异常。'
+    return 1
   fi
+  mv -f "$BIN.rollback" "$BIN"
+  systemctl restart mihomo || true
+  die '升级失败，已回滚。'
 }
 download_action(){ root; load_state; prompt_download; save_state; ok 'GitHub 下载方式已保存。'; }
-configure_action(){ root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; prompt_download; prompt_settings; test_cfg "$BIN" || die '配置检查失败，请从备份恢复。'; write_service; systemctl enable mihomo >/dev/null; systemctl restart mihomo; save_state; ok '设置已更新。'; show_summary; }
-status_action(){ show_summary; [[ -f $SERVICE ]] && systemctl status mihomo --no-pager || true; }
+configure_action(){
+  root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; prompt_download; prompt_settings; test_cfg "$BIN" || die '配置检查失败，请从备份恢复。'; write_service; systemctl enable mihomo >/dev/null; save_state
+  systemctl restart mihomo
+  if verify_after_start; then ok '设置已更新。'; else warn '设置已保存，但 Mihomo 当前运行异常。'; return 1; fi
+}
+service_control_action(){
+  local action=$1
+  root; systemd; load_state
+  systemctl "$action" mihomo
+  if [[ $action == stop ]]; then show_summary; return; fi
+  if verify_after_start; then ok "服务已${action/start/启动}"; else return 1; fi
+}
+status_action(){ show_summary; [[ -f $SERVICE ]] && systemctl status mihomo -l --no-pager || true; }
 uninstall_action(){
   root; systemd; load_state
   local yes=0 purge=0
@@ -311,7 +375,7 @@ sudo mhm configure           修改全部设置
 sudo mhm download            设置 GitHub 下载方式
 sudo mhm proxy               同上（兼容旧命令）
 sudo mhm start|stop|restart
-sudo mhm status              查看安装、运行和配置信息
+sudo mhm status              查看安装、运行、端口和配置信息
 sudo mhm logs                查看实时日志
 sudo mhm test                检查配置
 sudo mhm uninstall [--yes] [--purge]
@@ -331,15 +395,15 @@ menu(){
     local choice=
     read_tty choice '请选择 [0-11]：'
     case $choice in
-      1) install_action;;
-      2) upgrade_action;;
-      3) configure_action;;
+      1) install_action || true;;
+      2) upgrade_action || true;;
+      3) configure_action || true;;
       4) download_action;;
-      5) root; systemd; systemctl start mihomo;;
-      6) root; systemd; systemctl stop mihomo;;
-      7) root; systemd; systemctl restart mihomo;;
+      5) service_control_action start || true;;
+      6) service_control_action stop || true;;
+      7) service_control_action restart || true;;
       8) status_action;;
-      9) journalctl -u mihomo -n100 -f;;
+      9) journalctl -u mihomo -n100 -f -o cat;;
       10) load_state; [[ -x $BIN ]] || die '尚未安装。'; test_cfg "$BIN";;
       11) uninstall_action uninstall;;
       0) exit;;
@@ -355,9 +419,9 @@ case $cmd in
   upgrade|update) upgrade_action;;
   configure|config) configure_action;;
   download|proxy|github-proxy) download_action;;
-  start|stop|restart) root; systemd; systemctl "$cmd" mihomo;;
+  start|stop|restart) service_control_action "$cmd";;
   status) status_action;;
-  logs|log) journalctl -u mihomo -n100 -f;;
+  logs|log) journalctl -u mihomo -n100 -f -o cat;;
   test|check) load_state; [[ -x $BIN ]] || die '尚未安装。'; test_cfg "$BIN";;
   uninstall|remove) uninstall_action "$@";;
   -h|--help|help) help;;
