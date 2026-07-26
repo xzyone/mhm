@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION=1.2.0
+VERSION=1.2.1
 REPO=MetaCubeX/mihomo
 BIN=/usr/local/bin/mihomo
 SERVICE=/etc/systemd/system/mihomo.service
@@ -24,8 +24,18 @@ die(){ printf '%b[错误]%b %s\n' "$RED" "$R" "$*" >&2; exit 1; }
 trap '[[ -n ${TMP:-} && -d ${TMP:-} ]] && rm -rf "$TMP"' EXIT
 root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die '请使用 root 或 sudo 运行。'; }
 systemd(){ command -v systemctl >/dev/null || die '仅支持 systemd Linux。'; }
-read_tty(){ local n=$1 p=$2 s=${3:-0} v=; [[ -r /dev/tty ]] || die '当前环境无法交互输入。'; if [[ $s == 1 ]]; then IFS= read -r -s -p "$p" v </dev/tty || true; printf '\n' >/dev/tty; else IFS= read -r -p "$p" v </dev/tty || true; fi; printf -v "$n" '%s' "$v"; }
-confirm(){ local a=; read_tty a "$1 [y/N] "; [[ $a =~ ^[Yy]$ ]]; }
+read_tty(){
+  local __mhm_target=$1 __mhm_prompt=$2 __mhm_secret=${3:-0} __mhm_value=
+  [[ -r /dev/tty ]] || die '当前环境无法交互输入。'
+  if [[ $__mhm_secret == 1 ]]; then
+    IFS= read -r -s -p "$__mhm_prompt" __mhm_value </dev/tty || true
+    printf '\n' >/dev/tty
+  else
+    IFS= read -r -p "$__mhm_prompt" __mhm_value </dev/tty || true
+  fi
+  printf -v "$__mhm_target" '%s' "$__mhm_value"
+}
+confirm(){ local answer=; read_tty answer "$1 [y/N] "; [[ $answer =~ ^[Yy]$ ]]; }
 port_ok(){ [[ $1 =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
 dir_ok(){ [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ $1 != *'/../'* && $1 != */.. ]]; }
 mirror_ok(){ [[ $1 =~ ^https?://[^[:space:]]+$ ]]; }
@@ -52,13 +62,16 @@ save_state(){
 }
 
 deps(){
-  local p=(); command -v curl >/dev/null || p+=(curl ca-certificates); command -v gzip >/dev/null || p+=(gzip); ((${#p[@]}==0)) && return
-  if command -v apt-get >/dev/null; then apt-get update -y; DEBIAN_FRONTEND=noninteractive apt-get install -y "${p[@]}"
-  elif command -v dnf >/dev/null; then dnf install -y "${p[@]}"
-  elif command -v yum >/dev/null; then yum install -y "${p[@]}"
-  elif command -v apk >/dev/null; then apk add --no-cache "${p[@]}"
-  elif command -v pacman >/dev/null; then pacman -Sy --noconfirm "${p[@]}"
-  else die "请先安装：${p[*]}"; fi
+  local packages=()
+  command -v curl >/dev/null || packages+=(curl ca-certificates)
+  command -v gzip >/dev/null || packages+=(gzip)
+  ((${#packages[@]}==0)) && return
+  if command -v apt-get >/dev/null; then apt-get update -y; DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+  elif command -v dnf >/dev/null; then dnf install -y "${packages[@]}"
+  elif command -v yum >/dev/null; then yum install -y "${packages[@]}"
+  elif command -v apk >/dev/null; then apk add --no-cache "${packages[@]}"
+  elif command -v pacman >/dev/null; then pacman -Sy --noconfirm "${packages[@]}"
+  else die "请先安装：${packages[*]}"; fi
 }
 arch(){ case $(uname -m) in x86_64|amd64) echo amd64-compatible;; aarch64|arm64) echo arm64;; armv7l|armv7) echo armv7;; i386|i486|i586|i686) echo 386;; riscv64) echo riscv64;; s390x) echo s390x;; loongarch64) echo loong64-abi2;; *) die "不支持的架构：$(uname -m)";; esac; }
 
@@ -74,28 +87,41 @@ effective_transport_proxy(){
   else printf '%s' "$DOWNLOAD_PROXY"
   fi
 }
-mirror_url(){ local m; m=$(effective_mirror); [[ -n $m ]] && printf '%s/%s' "${m%/}" "$1" || printf '%s' "$1"; }
+mirror_url(){ local mirror; mirror=$(effective_mirror); [[ -n $mirror ]] && printf '%s/%s' "${mirror%/}" "$1" || printf '%s' "$1"; }
 curl_get(){
-  local url=$1 output=${2:-} p; p=$(effective_transport_proxy)
+  local url=$1 output=${2:-} proxy
+  proxy=$(effective_transport_proxy)
   local args=(-fL --retry 3 --connect-timeout 20 -A "mhm/$VERSION")
-  [[ -n $p ]] && args+=(--proxy "$p")
+  [[ -n $proxy ]] && args+=(--proxy "$proxy")
   [[ -n $output ]] && args+=(-o "$output")
   curl "${args[@]}" "$url"
 }
 latest(){
   if [[ -n ${MIHOMO_VERSION:-} ]]; then [[ $MIHOMO_VERSION == v* ]] && echo "$MIHOMO_VERSION" || echo "v$MIHOMO_VERSION"; return; fi
-  local api=https://api.github.com/repos/$REPO/releases/latest json= m=
+  local api=https://api.github.com/repos/$REPO/releases/latest json= mirror=
   json=$(curl_get "$api" 2>/dev/null || true)
-  if [[ -z $json ]]; then m=$(effective_mirror); [[ -n $m ]] && json=$(curl_get "${m%/}/$api" 2>/dev/null || true); fi
+  if [[ -z $json ]]; then mirror=$(effective_mirror); [[ -n $mirror ]] && json=$(curl_get "${mirror%/}/$api" 2>/dev/null || true); fi
   printf '%s' "$json" | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n1
 }
 download(){
-  deps; TMP=$(mktemp -d); local a t n u; a=$(arch); t=$(latest); [[ $t =~ ^v[0-9] ]] || die '无法获取 Mihomo 版本。可使用 MIHOMO_VERSION 指定版本。'; n=mihomo-linux-$a-$t.gz; u=$(mirror_url "https://github.com/$REPO/releases/download/$t/$n")
-  info "下载 $n"; curl_get "$u" "$TMP/mihomo.gz"; gzip -t "$TMP/mihomo.gz"; gzip -dc "$TMP/mihomo.gz" > "$TMP/mihomo"; chmod +x "$TMP/mihomo"; "$TMP/mihomo" -v >/dev/null || die '二进制无法运行。'
+  deps
+  TMP=$(mktemp -d)
+  local architecture tag filename url
+  architecture=$(arch)
+  tag=$(latest)
+  [[ $tag =~ ^v[0-9] ]] || die '无法获取 Mihomo 版本。可使用 MIHOMO_VERSION 指定版本。'
+  filename=mihomo-linux-$architecture-$tag.gz
+  url=$(mirror_url "https://github.com/$REPO/releases/download/$tag/$filename")
+  info "下载 $filename"
+  curl_get "$url" "$TMP/mihomo.gz"
+  gzip -t "$TMP/mihomo.gz"
+  gzip -dc "$TMP/mihomo.gz" > "$TMP/mihomo"
+  chmod +x "$TMP/mihomo"
+  "$TMP/mihomo" -v >/dev/null || die '二进制无法运行。'
 }
 secret_gen(){ command -v openssl >/dev/null && openssl rand -hex 16 || od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 yaml_q(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
-yaml_set(){ local f=$1 k=$2 v=$3 t; t=$(mktemp); awk -v k="$k" -v r="$k: $v" 'BEGIN{x=0}!x&&substr($0,1,length(k)+1)==k":"{print r;x=1;next}{print}END{if(!x)print r}' "$f" > "$t"; cat "$t" > "$f"; rm -f "$t"; }
+yaml_set(){ local file=$1 key=$2 value=$3 temporary; temporary=$(mktemp); awk -v k="$key" -v r="$key: $value" 'BEGIN{x=0}!x&&substr($0,1,length(k)+1)==k":"{print r;x=1;next}{print}END{if(!x)print r}' "$file" > "$temporary"; cat "$temporary" > "$file"; rm -f "$temporary"; }
 
 show_download(){
   if [[ -n $DOWNLOAD_PROXY ]]; then printf '网络代理：%s' "$DOWNLOAD_PROXY"
@@ -103,31 +129,85 @@ show_download(){
   else printf '直连 GitHub'
   fi
 }
+install_state(){
+  local has_binary=0 has_service=0
+  [[ -x $BIN ]] && has_binary=1
+  [[ -f $SERVICE ]] && has_service=1
+  if ((has_binary==0 && has_service==0)); then printf 'not-installed'
+  elif ((has_binary==1 && has_service==1)); then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mihomo 2>/dev/null; then printf 'running'; else printf 'stopped'; fi
+  elif ((has_binary==1)); then printf 'binary-only'
+  else printf 'broken'
+  fi
+}
+state_text(){
+  case $1 in
+    not-installed) printf '未安装';;
+    running) printf '运行中';;
+    stopped) printf '已安装，未运行';;
+    binary-only) printf '已安装，systemd 服务未注册';;
+    broken) printf 'systemd 服务已注册，但 Mihomo 二进制缺失';;
+  esac
+}
+mihomo_version(){
+  local version=
+  [[ -x $BIN ]] && version=$("$BIN" -v 2>/dev/null | sed -n '1p' || true)
+  printf '%s' "${version:-未知}"
+}
+autostart_text(){
+  if [[ ! -f $SERVICE ]]; then printf '未注册'
+  elif command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet mihomo 2>/dev/null; then printf '已启用'
+  else printf '未启用'
+  fi
+}
+show_summary(){
+  load_state
+  local state status version autostart secret_status
+  state=$(install_state)
+  status=$(state_text "$state")
+  printf '\n状态：%s\n' "$status"
+  [[ $state == not-installed ]] && return
+  version=$(mihomo_version)
+  autostart=$(autostart_text)
+  [[ -n $SECRET ]] && secret_status=已设置 || secret_status=未设置
+  printf 'Mihomo 版本：%s\n' "$version"
+  printf '配置目录：%s\n' "$CONFIG_DIR"
+  printf '配置文件：%s\n' "$CONFIG_FILE"
+  printf 'Mixed 端口：%s\n' "$MIXED_PORT"
+  printf '控制 API：%s:%s\n' "$CONTROLLER_HOST" "$CONTROLLER_PORT"
+  printf 'API Secret：%s\n' "$secret_status"
+  printf '开机自启：%s\n' "$autostart"
+  printf 'GitHub 下载方式：'; show_download; printf '\n'
+}
 prompt_download(){
-  local n= v=
+  local choice= value=
   printf '\n当前 GitHub 下载方式：'; show_download; printf '\n1. 直连 GitHub\n2. GitHub 镜像前缀（如 https://ghproxy.com）\n3. HTTP/SOCKS 网络代理（如 socks5h://127.0.0.1:12222）\n0. 保持不变\n'
-  read_tty n '请选择 [0-3]：'
-  case $n in
+  read_tty choice '请选择 [0-3]：'
+  case $choice in
     0|'') ;;
     1) GITHUB_MIRROR=; DOWNLOAD_PROXY=;;
-    2) read_tty v '镜像前缀：'; mirror_ok "$v" || die '镜像前缀必须以 http:// 或 https:// 开头。'; GITHUB_MIRROR=${v%/}; DOWNLOAD_PROXY=;;
-    3) read_tty v '代理地址：'; transport_proxy_ok "$v" || die '支持 http、https、socks、socks4、socks4a、socks5、socks5h。'; DOWNLOAD_PROXY=$v; GITHUB_MIRROR=;;
+    2) read_tty value '镜像前缀：'; mirror_ok "$value" || die '镜像前缀必须以 http:// 或 https:// 开头。'; GITHUB_MIRROR=${value%/}; DOWNLOAD_PROXY=;;
+    3) read_tty value '代理地址：'; transport_proxy_ok "$value" || die '支持 http、https、socks、socks4、socks4a、socks5、socks5h。'; DOWNLOAD_PROXY=$value; GITHUB_MIRROR=;;
     *) die '无效选项。';;
   esac
   printf '已选择：'; show_download; printf '\n'
 }
 prompt_settings(){
-  local v= old=$CONFIG_FILE
-  read_tty v "配置目录 [$CONFIG_DIR]："; [[ -n $v ]] && CONFIG_DIR=$v; dir_ok "$CONFIG_DIR" || die '配置目录无效。'
-  read_tty v "Mixed 端口 [$MIXED_PORT]："; [[ -n $v ]] && MIXED_PORT=$v; port_ok "$MIXED_PORT" || die 'Mixed 端口无效。'
-  read_tty v "控制 API 地址 [$CONTROLLER_HOST]："; [[ -n $v ]] && CONTROLLER_HOST=$v
-  read_tty v "控制 API 端口 [$CONTROLLER_PORT]："; [[ -n $v ]] && CONTROLLER_PORT=$v; port_ok "$CONTROLLER_PORT" || die '控制端口无效。'
-  read_tty v 'API Secret（留空则保留或生成）：' 1; [[ -n $v ]] && SECRET=$v; [[ -n $SECRET ]] || SECRET=$(secret_gen)
-  CONFIG_FILE=${CONFIG_DIR%/}/config.yaml; mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR" || true
-  [[ ! -f $CONFIG_FILE && -f $old && $old != "$CONFIG_FILE" ]] && cp -a "$old" "$CONFIG_FILE"
+  local value= old_config=$CONFIG_FILE
+  read_tty value "配置目录 [$CONFIG_DIR]："; [[ -n $value ]] && CONFIG_DIR=$value; dir_ok "$CONFIG_DIR" || die '配置目录无效。'
+  read_tty value "Mixed 端口 [$MIXED_PORT]："; [[ -n $value ]] && MIXED_PORT=$value; port_ok "$MIXED_PORT" || die 'Mixed 端口无效。'
+  read_tty value "控制 API 地址 [$CONTROLLER_HOST]："; [[ -n $value ]] && CONTROLLER_HOST=$value
+  read_tty value "控制 API 端口 [$CONTROLLER_PORT]："; [[ -n $value ]] && CONTROLLER_PORT=$value; port_ok "$CONTROLLER_PORT" || die '控制端口无效。'
+  read_tty value 'API Secret（留空则保留或生成）：' 1; [[ -n $value ]] && SECRET=$value; [[ -n $SECRET ]] || SECRET=$(secret_gen)
+  CONFIG_FILE=${CONFIG_DIR%/}/config.yaml
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" || true
+  [[ ! -f $CONFIG_FILE && -f $old_config && $old_config != "$CONFIG_FILE" ]] && cp -a "$old_config" "$CONFIG_FILE"
   if [[ -f $CONFIG_FILE ]]; then
     cp -a "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
-    yaml_set "$CONFIG_FILE" mixed-port "$MIXED_PORT"; yaml_set "$CONFIG_FILE" external-controller "$(yaml_q "$CONTROLLER_HOST:$CONTROLLER_PORT")"; yaml_set "$CONFIG_FILE" secret "$(yaml_q "$SECRET")"
+    yaml_set "$CONFIG_FILE" mixed-port "$MIXED_PORT"
+    yaml_set "$CONFIG_FILE" external-controller "$(yaml_q "$CONTROLLER_HOST:$CONTROLLER_PORT")"
+    yaml_set "$CONFIG_FILE" secret "$(yaml_q "$SECRET")"
     grep -q '^external-controller-cors:' "$CONFIG_FILE" || printf "\nexternal-controller-cors:\n  allow-origins:\n    - '*'\n  allow-private-network: true\n" >> "$CONFIG_FILE"
   else
     cat > "$CONFIG_FILE" <<CFG
@@ -172,16 +252,54 @@ UMask=0027
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload; }
-show(){ local ip=服务器IP h=$CONTROLLER_HOST; command -v hostname >/dev/null && ip=$(hostname -I 2>/dev/null | awk '{print $1}'); [[ -n $ip ]] || ip=服务器IP; [[ $h == 0.0.0.0 || $h == '[::]' ]] && h=$ip; printf '\n配置文件：%s\nMixed 代理：%s:%s\n控制 API：http://%s:%s\nAPI Secret：%s\nGitHub 下载方式：' "$CONFIG_FILE" "$ip" "$MIXED_PORT" "$h" "$CONTROLLER_PORT" "$SECRET"; show_download; printf '\n'; }
 
 install_action(){
-  root; systemd; load_state; prompt_download; save_state; download; prompt_settings; test_cfg "$TMP/mihomo" || die '配置检查失败。'; local rb=; [[ -x $BIN ]] && rb=$BIN.rollback && cp -a "$BIN" "$rb"; install -m 0755 "$TMP/mihomo" "$BIN"; write_service; systemctl enable mihomo >/dev/null
-  if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then rm -f "$rb"; save_state; ok 'Mihomo 已安装并设置为开机自启。'; show; else [[ -n $rb ]] && mv -f "$rb" "$BIN"; systemctl restart mihomo >/dev/null 2>&1 || true; die '启动失败，已尝试回滚。'; fi
+  root; systemd; load_state; prompt_download; save_state; download; prompt_settings; test_cfg "$TMP/mihomo" || die '配置检查失败。'
+  local rollback=
+  [[ -x $BIN ]] && rollback=$BIN.rollback && cp -a "$BIN" "$rollback"
+  install -m 0755 "$TMP/mihomo" "$BIN"
+  write_service
+  systemctl enable mihomo >/dev/null
+  if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then
+    [[ -n $rollback ]] && rm -f "$rollback"
+    save_state
+    ok 'Mihomo 已安装并设置为开机自启。'
+    show_summary
+  else
+    [[ -n $rollback ]] && mv -f "$rollback" "$BIN"
+    systemctl restart mihomo >/dev/null 2>&1 || true
+    die '启动失败，已尝试回滚。'
+  fi
 }
-upgrade_action(){ root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; download; test_cfg "$TMP/mihomo" || die '新版本不兼容当前配置。'; cp -a "$BIN" "$BIN.rollback"; install -m 0755 "$TMP/mihomo" "$BIN"; if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then rm -f "$BIN.rollback"; ok '升级完成。'; else mv -f "$BIN.rollback" "$BIN"; systemctl restart mihomo || true; die '升级失败，已回滚。'; fi; }
+upgrade_action(){
+  root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; download; test_cfg "$TMP/mihomo" || die '新版本不兼容当前配置。'
+  cp -a "$BIN" "$BIN.rollback"
+  install -m 0755 "$TMP/mihomo" "$BIN"
+  if systemctl restart mihomo && sleep 1 && systemctl is-active --quiet mihomo; then
+    rm -f "$BIN.rollback"
+    ok '升级完成。'
+    show_summary
+  else
+    mv -f "$BIN.rollback" "$BIN"
+    systemctl restart mihomo || true
+    die '升级失败，已回滚。'
+  fi
+}
 download_action(){ root; load_state; prompt_download; save_state; ok 'GitHub 下载方式已保存。'; }
-configure_action(){ root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; prompt_download; prompt_settings; test_cfg "$BIN" || die '配置检查失败，请从备份恢复。'; write_service; systemctl enable mihomo >/dev/null; systemctl restart mihomo; save_state; ok '设置已更新。'; show; }
-uninstall_action(){ root; systemd; load_state; local yes=0 purge=0; shift || true; while (($#)); do case $1 in -y|--yes) yes=1;; --purge) purge=1;; *) die "未知参数：$1";; esac; shift; done; ((yes)) || confirm '确定卸载 Mihomo 吗？' || return; systemctl disable --now mihomo >/dev/null 2>&1 || true; rm -f "$SERVICE" "$BIN" "$STATE"; systemctl daemon-reload; if ((purge)); then case $CONFIG_DIR in /|/etc|/usr|/var|/home|/root|/opt|/srv) warn "拒绝删除危险目录：$CONFIG_DIR";; *) rm -rf -- "$CONFIG_DIR";; esac; fi; ok 'Mihomo 已卸载。'; }
+configure_action(){ root; systemd; load_state; [[ -x $BIN ]] || die '尚未安装。'; prompt_download; prompt_settings; test_cfg "$BIN" || die '配置检查失败，请从备份恢复。'; write_service; systemctl enable mihomo >/dev/null; systemctl restart mihomo; save_state; ok '设置已更新。'; show_summary; }
+status_action(){ show_summary; [[ -f $SERVICE ]] && systemctl status mihomo --no-pager || true; }
+uninstall_action(){
+  root; systemd; load_state
+  local yes=0 purge=0
+  shift || true
+  while (($#)); do case $1 in -y|--yes) yes=1;; --purge) purge=1;; *) die "未知参数：$1";; esac; shift; done
+  ((yes)) || confirm '确定卸载 Mihomo 吗？' || return
+  systemctl disable --now mihomo >/dev/null 2>&1 || true
+  rm -f "$SERVICE" "$BIN" "$STATE"
+  systemctl daemon-reload
+  if ((purge)); then case $CONFIG_DIR in /|/etc|/usr|/var|/home|/root|/opt|/srv) warn "拒绝删除危险目录：$CONFIG_DIR";; *) rm -rf -- "$CONFIG_DIR";; esac; fi
+  ok 'Mihomo 已卸载。'
+}
 
 help(){ cat <<HELP
 mhm v$VERSION - Mihomo Linux 管理脚本
@@ -193,7 +311,7 @@ sudo mhm configure           修改全部设置
 sudo mhm download            设置 GitHub 下载方式
 sudo mhm proxy               同上（兼容旧命令）
 sudo mhm start|stop|restart
-sudo mhm status              查看状态
+sudo mhm status              查看安装、运行和配置信息
 sudo mhm logs                查看实时日志
 sudo mhm test                检查配置
 sudo mhm uninstall [--yes] [--purge]
@@ -205,14 +323,44 @@ MIHOMO_DOWNLOAD_PROXY=socks5h://127.0.0.1:12222
 MIHOMO_GITHUB_PROXY=...       兼容旧变量；SOCKS 地址自动作为网络代理
 HELP
 }
-menu(){ while true; do printf '\n%bmhm v%s%b\n1. 安装/重装\n2. 升级\n3. 修改全部设置\n4. 设置 GitHub 下载方式\n5. 启动\n6. 停止\n7. 重启\n8. 状态\n9. 日志\n10. 检查配置\n11. 卸载\n0. 退出\n' "$CYAN" "$VERSION" "$R"; local n=; read_tty n '请选择 [0-11]：'; case $n in 1) install_action;; 2) upgrade_action;; 3) configure_action;; 4) download_action;; 5) root; systemctl start mihomo;; 6) root; systemctl stop mihomo;; 7) root; systemctl restart mihomo;; 8) load_state; "$BIN" -v 2>/dev/null || true; systemctl status mihomo --no-pager || true; show;; 9) journalctl -u mihomo -n100 -f;; 10) load_state; test_cfg "$BIN";; 11) uninstall_action uninstall;; 0) exit;; *) warn '无效选项。';; esac; done; }
+menu(){
+  while true; do
+    printf '\n%bmhm v%s%b\n' "$CYAN" "$VERSION" "$R"
+    show_summary
+    printf '\n1. 安装/重装\n2. 升级\n3. 修改全部设置\n4. 设置 GitHub 下载方式\n5. 启动\n6. 停止\n7. 重启\n8. 详细状态\n9. 日志\n10. 检查配置\n11. 卸载\n0. 退出\n'
+    local choice=
+    read_tty choice '请选择 [0-11]：'
+    case $choice in
+      1) install_action;;
+      2) upgrade_action;;
+      3) configure_action;;
+      4) download_action;;
+      5) root; systemd; systemctl start mihomo;;
+      6) root; systemd; systemctl stop mihomo;;
+      7) root; systemd; systemctl restart mihomo;;
+      8) status_action;;
+      9) journalctl -u mihomo -n100 -f;;
+      10) load_state; [[ -x $BIN ]] || die '尚未安装。'; test_cfg "$BIN";;
+      11) uninstall_action uninstall;;
+      0) exit;;
+      *) warn '无效选项。';;
+    esac
+  done
+}
 
 cmd=${1:-menu}
 case $cmd in
-  menu) menu;; install) install_action;; upgrade|update) upgrade_action;; configure|config) configure_action;; download|proxy|github-proxy) download_action;;
+  menu) menu;;
+  install) install_action;;
+  upgrade|update) upgrade_action;;
+  configure|config) configure_action;;
+  download|proxy|github-proxy) download_action;;
   start|stop|restart) root; systemd; systemctl "$cmd" mihomo;;
-  status) load_state; "$BIN" -v 2>/dev/null || true; systemctl status mihomo --no-pager || true; [[ -f $STATE ]] && show;;
-  logs|log) journalctl -u mihomo -n100 -f;; test|check) load_state; test_cfg "$BIN";;
-  uninstall|remove) uninstall_action "$@";; -h|--help|help) help;; -v|--version|version) echo "mhm $VERSION";;
+  status) status_action;;
+  logs|log) journalctl -u mihomo -n100 -f;;
+  test|check) load_state; [[ -x $BIN ]] || die '尚未安装。'; test_cfg "$BIN";;
+  uninstall|remove) uninstall_action "$@";;
+  -h|--help|help) help;;
+  -v|--version|version) echo "mhm $VERSION";;
   *) die "未知命令：$cmd";;
 esac
