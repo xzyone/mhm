@@ -5,8 +5,8 @@
 ## 功能
 
 - 自动识别 CPU 架构并下载 Mihomo 最新稳定版
-- 支持指定 Mihomo 版本和 GitHub 下载代理
-- 交互设置 Mixed 代理端口、控制 API 地址及端口、配置目录和 API Secret
+- 支持指定 Mihomo 版本，并持久保存 GitHub 下载代理
+- 交互设置 GitHub 下载代理、Mixed 代理端口、控制 API 地址及端口、配置目录和 API Secret
 - 自动创建并启用 `mihomo.service`
 - 保留已有 `config.yaml`，修改前自动备份
 - 升级或重启失败时自动回滚二进制、配置和 systemd 服务
@@ -37,7 +37,8 @@ sudo ./mhm
 sudo mhm                    # 打开互动菜单
 sudo mhm install            # 安装或重新安装 Mihomo
 sudo mhm upgrade            # 升级 Mihomo
-sudo mhm configure          # 修改端口、配置目录和 API Secret
+sudo mhm configure          # 修改下载代理、端口、配置目录和 API Secret
+sudo mhm proxy              # 单独设置或清除 GitHub 下载代理
 sudo mhm start              # 启动服务
 sudo mhm stop               # 停止服务
 sudo mhm restart            # 重启服务
@@ -75,11 +76,29 @@ sudo MIHOMO_VERSION=v1.19.29 mhm upgrade
 
 ## 使用 GitHub 下载代理
 
+下载代理可以作为持久设置保存到 `/etc/mhm.conf`：
+
 ```bash
-sudo MIHOMO_GITHUB_PROXY=https://gh-proxy.example mhm upgrade
+sudo mhm proxy
 ```
 
-代理地址会作为 GitHub Release 原始下载链接的前缀。
+按提示输入代理地址，例如：
+
+```text
+https://gh-proxy.example
+```
+
+之后执行 `mhm install` 或 `mhm upgrade` 时会自动使用该代理。输入 `none`、`off`、`clear` 或 `-` 可以清除设置并恢复直连。
+
+安装流程会在下载 Mihomo 之前先询问代理地址，因此首次安装时也可以直接使用 GitHub 下载代理。
+
+仍然可以通过环境变量临时覆盖已保存的设置：
+
+```bash
+sudo MIHOMO_GITHUB_PROXY=https://another-proxy.example mhm upgrade
+```
+
+环境变量只对当前命令生效，优先级高于 `/etc/mhm.conf` 中保存的代理。代理地址会作为 GitHub Release 原始下载链接的前缀。
 
 ## 配置处理
 
@@ -128,7 +147,7 @@ sudo rm -f /usr/local/bin/mhm
 
 - 使用 systemd 的 Linux 发行版
 - root 权限
-- `curl` 或 `wget`
+- `curl`
 - `gzip`、`awk`、`sed`、`grep`、`install` 等常用系统工具
 
 ## 免责声明
