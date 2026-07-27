@@ -25,6 +25,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
       - name: Read and validate version
         id: version
         shell: bash
@@ -38,6 +43,18 @@ jobs:
           fi
 
           bash -n mhm
+          shellcheck --severity=error mhm
+
+          if grep -Fq "read_tty x '订阅 URL：' 1" mhm; then
+            echo "Subscription URL input must remain visible." >&2
+            exit 1
+          fi
+
+          grep -Fq 'local __mhm_target=' mhm || {
+            echo "read_tty must use isolated internal variable names." >&2
+            exit 1
+          }
+
           chmod +x mhm
 
           tag="v${version}"
