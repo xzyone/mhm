@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION=1.3.3
+VERSION=1.3.4
 MIHOMO_REPO=MetaCubeX/mihomo
 MHM_REPO=xzyone/mhm
 MHM_BIN=/usr/local/bin/mhm
@@ -197,6 +197,114 @@ yaml_set(){
   awk -v k="$key" -v r="$key: $value" 'BEGIN{x=0}!x&&substr($0,1,length(k)+1)==k":"{print r;x=1;next}{print}END{if(!x)print r}' "$file" > "$temporary"
   cat "$temporary" > "$file"
   rm -f "$temporary"
+}
+yaml_has_top_key(){ grep -Eq "^$2:[[:space:]]*" "$1"; }
+yaml_remove_top_key(){
+  local file=$1 key=$2 temporary
+  temporary=$(mktemp)
+  awk -v key="$key" '
+    function is_top(line){return line ~ /^[^[:space:]#][^:]*:[[:space:]]*/}
+    BEGIN{skip=0}
+    {
+      if (!skip && $0 ~ ("^" key ":[[:space:]]*")){skip=1;next}
+      if (skip && is_top($0)){skip=0}
+      if (!skip) print
+    }
+  ' "$file" > "$temporary"
+  cat "$temporary" > "$file"
+  rm -f "$temporary"
+}
+yaml_extract_top_key(){
+  local file=$1 key=$2
+  awk -v key="$key" '
+    function is_top(line){return line ~ /^[^[:space:]#][^:]*:[[:space:]]*/}
+    BEGIN{take=0}
+    {
+      if (!take && $0 ~ ("^" key ":[[:space:]]*")){take=1;print;next}
+      if (take && is_top($0)) exit
+      if (take) print
+    }
+  ' "$file"
+}
+yaml_replace_top_key_from_file(){
+  local target=$1 source=$2 key=$3 block=
+  yaml_remove_top_key "$target" "$key"
+  if yaml_has_top_key "$source" "$key"; then
+    block=$(yaml_extract_top_key "$source" "$key")
+    printf '\n%s\n' "$block" >> "$target"
+  fi
+}
+yaml_nested_scalar_line(){
+  local file=$1 parent=$2 child=$3
+  awk -v parent="$parent" -v child="$child" '
+    function is_top(line){return line ~ /^[^[:space:]#][^:]*:[[:space:]]*/}
+    BEGIN{inside=0}
+    {
+      if ($0 ~ ("^" parent ":[[:space:]]*")){inside=1;next}
+      if (inside && is_top($0)) exit
+      if (inside && $0 ~ ("^[[:space:]]+" child ":[[:space:]]*")){
+        sub(/^[[:space:]]+/, "", $0); print; exit
+      }
+    }
+  ' "$file"
+}
+yaml_remove_nested_scalar(){
+  local file=$1 parent=$2 child=$3 temporary
+  temporary=$(mktemp)
+  awk -v parent="$parent" -v child="$child" '
+    function is_top(line){return line ~ /^[^[:space:]#][^:]*:[[:space:]]*/}
+    BEGIN{inside=0}
+    {
+      if ($0 ~ ("^" parent ":[[:space:]]*")){inside=1;print;next}
+      if (inside && is_top($0)) inside=0
+      if (inside && $0 ~ ("^[[:space:]]+" child ":[[:space:]]*")) next
+      print
+    }
+  ' "$file" > "$temporary"
+  cat "$temporary" > "$file"
+  rm -f "$temporary"
+}
+yaml_insert_nested_scalar(){
+  local file=$1 parent=$2 line=$3 temporary
+  temporary=$(mktemp)
+  awk -v parent="$parent" -v line="$line" '
+    BEGIN{done=0}
+    {
+      print
+      if (!done && $0 ~ ("^" parent ":[[:space:]]*")){print "  " line;done=1}
+    }
+    END{if(!done){print "";print parent ":";print "  " line}}
+  ' "$file" > "$temporary"
+  cat "$temporary" > "$file"
+  rm -f "$temporary"
+}
+merge_local_runtime(){
+  local local_file=$1 target=$2 key dns_listen=
+  local protected_keys=(
+    port socks-port redir-port tproxy-port mixed-port
+    allow-lan bind-address authentication skip-auth-prefixes
+    lan-allowed-ips lan-disallowed-ips
+    external-controller external-controller-tls external-controller-unix
+    external-controller-pipe external-controller-cors secret
+    external-ui external-ui-name external-ui-url external-doh-server
+    interface-name routing-mark profile tls
+    tun listeners tunnels iptables ebpf
+  )
+  for key in "${protected_keys[@]}"; do
+    yaml_replace_top_key_from_file "$target" "$local_file" "$key"
+  done
+
+  if yaml_has_top_key "$local_file" dns; then
+    if yaml_has_top_key "$target" dns; then
+      dns_listen=$(yaml_nested_scalar_line "$local_file" dns listen || true)
+      yaml_remove_nested_scalar "$target" dns listen
+      [[ -n $dns_listen ]] && yaml_insert_nested_scalar "$target" dns "$dns_listen"
+    else
+      yaml_replace_top_key_from_file "$target" "$local_file" dns
+    fi
+  else
+    yaml_remove_nested_scalar "$target" dns listen
+  fi
 }
 ensure_cors(){
   grep -q '^external-controller-cors:' "$1" || cat >> "$1" <<'CFG'
@@ -450,17 +558,32 @@ verify_service(){
 }
 
 prepare_subscription(){
-  local file=$1
+  local file=$1 dns_listen=
   info '下载完整配置订阅'
   curl_file "$SUBSCRIPTION_URL" "$file" "$SUBSCRIPTION_USER_AGENT"
   [[ -s $file ]] || die '订阅返回空文件。'
   grep -Eqi '<html|<!doctype' "$file" && die '订阅返回的是网页，不是 YAML 配置。'
+
+  if [[ -f $CONFIG_FILE ]]; then
+    info '合并订阅并保留本地运行设置'
+    merge_local_runtime "$CONFIG_FILE" "$file"
+  fi
+
   yaml_set "$file" mixed-port "$MIXED_PORT"
-  yaml_set "$file" allow-lan true
-  yaml_set "$file" bind-address "$(quote_yaml '*')"
   yaml_set "$file" external-controller "$(quote_yaml "$CONTROLLER_HOST:$CONTROLLER_PORT")"
   yaml_set "$file" secret "$(quote_yaml "$SECRET")"
+  yaml_has_top_key "$file" allow-lan || yaml_set "$file" allow-lan true
+  yaml_has_top_key "$file" bind-address || yaml_set "$file" bind-address "$(quote_yaml '*')"
   ensure_cors "$file"
+
+  dns_listen=$(yaml_nested_scalar_line "$file" dns listen || true)
+  if [[ -n $dns_listen ]]; then
+    info "保留本地 DNS 监听：${dns_listen#listen: }"
+  else
+    info '本地未配置 DNS 监听，已移除订阅中的 dns.listen'
+  fi
+  info "保留本地 Mixed 端口：$MIXED_PORT"
+  info "保留本地控制 API：$CONTROLLER_HOST:$CONTROLLER_PORT"
   grep -Eq '^(rules|rule-providers):' "$file" || warn '订阅中未发现 rules 或 rule-providers 字段。'
 }
 subscription_update(){
