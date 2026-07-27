@@ -1,11 +1,9 @@
 name: Release mhm
 
+# GitHub Actions quota is currently unavailable, so releases are not triggered
+# automatically on every push. Run this workflow manually after the quota is
+# restored, or create the release from the GitHub Releases page.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - mhm
   workflow_dispatch:
 
 permissions:
@@ -45,7 +43,7 @@ jobs:
           bash -n mhm
           shellcheck --severity=error mhm
 
-          if grep -Fq "read_tty x '订阅 URL：' 1" mhm; then
+          if grep -Fq "read_tty value '订阅 URL：' 1" mhm; then
             echo "Subscription URL input must remain visible." >&2
             exit 1
           fi
@@ -59,7 +57,7 @@ jobs:
 
           tag="v${version}"
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "${tag} already exists. Bump VERSION before changing mhm." >&2
+            echo "${tag} already exists. Bump VERSION before releasing." >&2
             exit 1
           fi
 
