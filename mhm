@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION=1.3.2
+VERSION=1.3.3
 MIHOMO_REPO=MetaCubeX/mihomo
 MHM_REPO=xzyone/mhm
 MHM_BIN=/usr/local/bin/mhm
@@ -298,46 +298,77 @@ download_name(){ [[ -n $DOWNLOAD_PROXY ]] && echo 网络代理 || { [[ -n $GITHU
 
 ui_line(){ printf '%b%s%b\n' "$CYAN" '────────────────────────────────────────────────────────────────────' "$R"; }
 ui_title(){ printf '%b%s%b\n' "$B$WHITE" "$1" "$R"; }
+ui_field(){
+  local label=$1 value=$2
+  if [[ -t 1 ]]; then
+    printf '  %s' "$label"
+    printf '\033[18G%b\n' "$value"
+  else
+    printf '  %s: %b\n' "$label" "$value"
+  fi
+}
+menu_section(){ printf '\n%b%s%b\n' "$BLUE$B" "$1" "$R"; }
+menu_item(){
+  local number=$1 text=$2
+  if [[ -t 1 ]]; then
+    printf '  %b[%2s]%b' "$CYAN" "$number" "$R"
+    printf '\033[10G%s\n' "$text"
+  else
+    printf '  [%2s] %s\n' "$number" "$text"
+  fi
+}
 dashboard(){
   load_state
   evaluate_health
-  local color status auto
+  local color status auto secret_state
   color=$(state_color "$RUN_STATE")
   status=$(state_name "$RUN_STATE")
   auto=$(systemctl is-enabled --quiet mihomo 2>/dev/null && echo 已启用 || echo 未启用)
+  secret_state=$([[ -n $SECRET ]] && echo 已设置 || echo 未设置)
 
   printf '\n'
   ui_line
   ui_title "  mhm v$VERSION  ·  Mihomo Linux Manager"
   ui_line
-  printf '  状态          %b%b%s%b\n' "$color" "$B" "$status" "$R"
+  ui_field '状态' "${color}${B}${status}${R}"
   if [[ $RUN_STATE != not-installed ]]; then
-    printf '  Mihomo        %s\n' "$(short_mihomo_version)"
-    printf '  Mixed         0.0.0.0:%s  [%s]\n' "$MIXED_PORT" "$(health_name "$MIXED_HEALTH" "$MIXED_OWNER")"
-    printf '  Controller    %s:%s  [%s]\n' "$CONTROLLER_HOST" "$CONTROLLER_PORT" "$(health_name "$API_HEALTH" "$API_OWNER")"
-    printf '  配置文件      %s\n' "$CONFIG_FILE"
-    printf '  API Secret    %s    开机自启：%s\n' "$([[ -n $SECRET ]] && echo 已设置 || echo 未设置)" "$auto"
+    ui_field 'Mihomo' "$(short_mihomo_version)"
+    ui_field 'Mixed' "0.0.0.0:$MIXED_PORT  [$(health_name "$MIXED_HEALTH" "$MIXED_OWNER")]"
+    ui_field 'Controller' "$CONTROLLER_HOST:$CONTROLLER_PORT  [$(health_name "$API_HEALTH" "$API_OWNER")]"
+    ui_field '配置文件' "$CONFIG_FILE"
+    ui_field 'API Secret' "$secret_state"
+    ui_field '开机自启' "$auto"
   fi
-  printf '  完整订阅      %s\n' "$(subscription_name)"
-  printf '  GitHub 下载   %s\n' "$(download_name)"
-  [[ -n $LOG_ERROR ]] && printf '  %b启动错误      %s%b\n' "$RED" "$LOG_ERROR" "$R"
+  ui_field '完整订阅' "$(subscription_name)"
+  ui_field 'GitHub 下载' "$(download_name)"
+  [[ -n $LOG_ERROR ]] && ui_field '启动错误' "${RED}${LOG_ERROR}${R}"
   ui_line
 }
 main_menu(){
-  printf '\n%b╭─ 核心管理%b\n' "$BLUE" "$R"
-  printf '  %b[1]%b  安装 / 重装 Mihomo\n' "$CYAN" "$R"
-  printf '  %b[2]%b  升级 Mihomo\n' "$CYAN" "$R"
-  printf '  %b[12]%b 更新 mhm 管理脚本\n' "$CYAN" "$R"
-  printf '%b├─ 配置与订阅%b\n' "$BLUE" "$R"
-  printf '  %b[3]%b  完整配置订阅管理\n' "$CYAN" "$R"
-  printf '  %b[4]%b  修改运行设置\n' "$CYAN" "$R"
-  printf '  %b[5]%b  GitHub 下载设置\n' "$CYAN" "$R"
-  printf '%b├─ 服务与诊断%b\n' "$BLUE" "$R"
-  printf '  %b[6]%b  启动服务      %b[7]%b 停止服务      %b[8]%b 重启服务\n' "$CYAN" "$R" "$CYAN" "$R" "$CYAN" "$R"
-  printf '  %b[9]%b  详细状态      %b[10]%b 实时日志      %b[11]%b 检查配置\n' "$CYAN" "$R" "$CYAN" "$R" "$CYAN" "$R"
-  printf '%b├─ 其他%b\n' "$BLUE" "$R"
-  printf '  %b[13]%b 卸载          %b[0]%b 退出\n' "$CYAN" "$R" "$CYAN" "$R"
-  printf '%b╰──────────────────────────────────────────────────────────────────%b\n' "$BLUE" "$R"
+  menu_section 'Mihomo 核心'
+  menu_item 1 '安装 / 重装 Mihomo'
+  menu_item 2 '升级 Mihomo'
+
+  menu_section '配置与订阅'
+  menu_item 3 '完整配置订阅管理'
+  menu_item 4 '修改运行设置'
+  menu_item 5 'GitHub 下载设置'
+
+  menu_section '服务与诊断'
+  menu_item 6 '启动服务'
+  menu_item 7 '停止服务'
+  menu_item 8 '重启服务'
+  menu_item 9 '详细状态'
+  menu_item 10 '实时日志'
+  menu_item 11 '检查配置'
+
+  menu_section 'mhm 管理'
+  menu_item 12 '更新 mhm 管理脚本'
+
+  menu_section '其他'
+  menu_item 13 '卸载 Mihomo'
+  menu_item 0 '退出'
+  printf '\n'
 }
 
 port_free(){
